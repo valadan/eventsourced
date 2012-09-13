@@ -15,18 +15,41 @@
  */
 package org.eligosource.eventsourced.journal
 
-import scala.collection.immutable.SortedMap
+import java.io.File
+import java.nio.ByteBuffer
 
 import akka.actor._
 
+import org.fusesource.leveldbjni.JniDBFactory._
+import org.iq80.leveldb._
+
 import org.eligosource.eventsourced.core._
+import org.eligosource.eventsourced.util.JavaSerializer
 
 /**
- * In-memory journal for testing purposes.
+ * LevelDB based journal that organizes entries based on component id.
+ *
+ * Pros:
+ *
+ *  - efficient replay of input messages for composites
+ *  - efficient replay of input messages for individual components
+ *  - efficient replay of output messages for individual components
+ *
+ * Cons:
+ *
+ *  - deletion of old entries requires full scan
  */
-class InmemJournal extends Actor {
+class LeveldbJournalCS(dir: File) extends Actor {
+  import LeveldbJournalCS._
+
+  // TODO: make configurable
+  private val serializer = new JavaSerializer[Message]
+
+  val levelDbReadOptions = new ReadOptions
+  val levelDbWriteOptions = new WriteOptions().sync(false)
+  val leveldb = factory.open(dir, new Options().createIfMissing(true))
+
   var commandListener: Option[ActorRef] = None
-  var redoMap = SortedMap.empty[Key, Any]
   var counter = 0L
 
   def receive = {
@@ -69,52 +92,71 @@ class InmemJournal extends Actor {
   }
 
   def store(cmd: WriteMsg) {
+    val batch = leveldb.createWriteBatch()
     val msg = cmd.message
+    try {
+      // add message to batch
+      counter = msg.sequenceNr
+      val k = Key(cmd.componentId, cmd.channelId, msg.sequenceNr, 0)
+      val m = msg.copy(sender = None)
+      batch.put(CounterKeyBytes, counterToBytes(counter))
+      batch.put(k.bytes, serializer.toBytes(m.copy(sender = None)))
 
-    counter = msg.sequenceNr
-    val k = Key(cmd.componentId, cmd.channelId, msg.sequenceNr, 0)
-    val m = msg.copy(sender = None)
-    redoMap = redoMap + (k -> m)
-
-    cmd.ackSequenceNr.foreach { snr =>
-      val k = Key(cmd.componentId, Channel.inputChannelId, snr, cmd.channelId)
-      redoMap = redoMap + (k -> null)
+      // optionally, add ack to batch
+      cmd.ackSequenceNr.foreach { snr =>
+        val k = Key(cmd.componentId, Channel.inputChannelId, snr, cmd.channelId)
+        batch.put(k.bytes, Array.empty[Byte])
+      }
+      leveldb.write(batch, levelDbWriteOptions)
+      counter = counter + 1
+    } finally {
+      batch.close()
     }
-
-    counter = counter + 1
   }
 
   def store(cmd: WriteAck) {
     val k = Key(cmd.componentId, Channel.inputChannelId, cmd.ackSequenceNr, cmd.channelId)
-    redoMap = redoMap + (k -> null)
+    leveldb.put(k.bytes, Array.empty[Byte], levelDbWriteOptions)
   }
 
   def store(cmd: DeleteMsg) {
     val k = Key(cmd.componentId, cmd.channelId, cmd.msgSequenceNr, 0)
-    redoMap = redoMap - k
+    leveldb.delete(k.bytes, levelDbWriteOptions)
   }
-
-  def getCounter = counter + 1
 
   override def preStart() {
     counter = getCounter
   }
 
-  def replay(componentId: Int, channelId: Int, fromSequenceNr: Long, p: Message => Unit): Unit = {
-    val startKey = Key(componentId, channelId, fromSequenceNr, 0)
-    val iter = redoMap.from(startKey).iterator.buffered
-    replay(iter, startKey, p)
+  override def postStop() {
+    leveldb.close()
+  }
+
+  private def getCounter = leveldb.get(CounterKeyBytes, levelDbReadOptions) match {
+    case null  => 1L
+    case bytes => bytesToCounter(bytes) + 1L
+  }
+
+  private def replay(componentId: Int, channelId: Int, fromSequenceNr: Long, p: Message => Unit): Unit = {
+    val iter = leveldb.iterator(levelDbReadOptions.snapshot(leveldb.getSnapshot))
+    try {
+      val startKey = Key(componentId, channelId, fromSequenceNr, 0)
+      iter.seek(startKey.bytes)
+      replay(iter, startKey, p)
+    } finally {
+      iter.close()
+    }
   }
 
   @scala.annotation.tailrec
-  private def replay(iter: BufferedIterator[(Key, Any)], key: Key, p: Message => Unit): Unit = {
+  private def replay(iter: DBIterator, key: Key, p: Message => Unit): Unit = {
     if (iter.hasNext) {
       val nextEntry = iter.next()
-      val nextKey   = nextEntry._1
+      val nextKey = Key(nextEntry.getKey)
       assert(nextKey.confirmingChannelId == 0)
       if (key.componentId         == nextKey.componentId &&
-          key.initiatingChannelId == nextKey.initiatingChannelId) {
-        val msg = nextEntry._2.asInstanceOf[Message]
+        key.initiatingChannelId == nextKey.initiatingChannelId) {
+        val msg = serializer.fromBytes(nextEntry.getValue)
         val channelIds = confirmingChannelIds(iter, nextKey, Nil)
         p(msg.copy(acks = channelIds))
         replay(iter, nextKey, p)
@@ -123,16 +165,27 @@ class InmemJournal extends Actor {
   }
 
   @scala.annotation.tailrec
-  private def confirmingChannelIds(iter: BufferedIterator[(Key, Any)], key: Key, channelIds: List[Int]): List[Int] = {
+  private def confirmingChannelIds(iter: DBIterator, key: Key, channelIds: List[Int]): List[Int] = {
     if (iter.hasNext) {
-      val nextEntry = iter.head
-      val nextKey = nextEntry._1
+      val nextEntry = iter.peekNext()
+      val nextKey = Key(nextEntry.getKey)
       if (key.componentId         == nextKey.componentId &&
-          key.initiatingChannelId == nextKey.initiatingChannelId &&
-          key.sequenceNr          == nextKey.sequenceNr) {
+        key.initiatingChannelId == nextKey.initiatingChannelId &&
+        key.sequenceNr          == nextKey.sequenceNr) {
         iter.next()
         confirmingChannelIds(iter, nextKey, nextKey.confirmingChannelId :: channelIds)
       } else channelIds
     } else channelIds
   }
+
+}
+
+private object LeveldbJournalCS {
+  val CounterKeyBytes = Key(0, 0, 0L, 0).bytes
+
+  def counterToBytes(value: Long) =
+    ByteBuffer.allocate(8).putLong(value).array
+
+  def bytesToCounter(bytes: Array[Byte]) =
+    ByteBuffer.wrap(bytes).getLong
 }

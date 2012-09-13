@@ -15,17 +15,21 @@
  */
 package org.eligosource.eventsourced.journal
 
-import java.io.File
+/**
+ * LevelDB based journal that organizes entries based on message sequence numbers.
+ *
+ * Pros:
+ *
+ *  - efficient replay of input messages for composites i.e. single scan
+ *    (with optional lower bound) for n components.
+ *  - efficient replay of output messages for individual components
+ *  - efficient deletion of old entries
+ *
+ * Cons:
+ *
+ *  - replay of input messages for individual component requires full scan
+ *    (with optional lower bound)
+ */
+class LeveldbJournalSS {
 
-import akka.actor._
-
-object LeveldbJournal {
-  def componentStructured(dir: File)(implicit system: ActorSystem): ActorRef =
-    system.actorOf(Props(new LeveldbJournalCS(dir)))
-
-  def sequenceStructured(dir: File)(implicit system: ActorSystem): ActorRef =
-    system.actorOf(Props(new LeveldbJournalCS(dir)))
-
-  def apply(dir: File)(implicit system: ActorSystem) =
-    componentStructured(dir)
 }

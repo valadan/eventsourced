@@ -153,10 +153,15 @@ class InmenJournalSpec extends JournalSpec {
     system.actorOf(Props(new InmemJournal))
 }
 
-class LeveldbJournalSpec extends JournalSpec {
+class LeveldbJournalCSSpec extends JournalSpec {
   def createJournal(journalDir: File)(implicit system: ActorSystem) =
-    system.actorOf(Props(new LeveldbJournal(journalDir)))
+    system.actorOf(Props(new LeveldbJournalCS(journalDir)))
 }
+
+/*class LeveldbJournalSSSpec extends JournalSpec {
+  def createJournal(journalDir: File)(implicit system: ActorSystem) =
+    system.actorOf(Props(new LeveldbJournalSS(journalDir)))
+}*/
 
 class JournalioJournalSpec extends JournalSpec {
   def createJournal(journalDir: File)(implicit system: ActorSystem) =
