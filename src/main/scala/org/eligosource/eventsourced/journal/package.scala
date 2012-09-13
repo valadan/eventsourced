@@ -16,7 +16,7 @@
 package org.eligosource.eventsourced
 
 package object journal {
-  implicit val ordering = new Ordering[Key] {
+  private [journal] implicit val ordering = new Ordering[Key] {
     def compare(x: Key, y: Key) =
       if (x.componentId != y.componentId)
         x.componentId - y.componentId
@@ -28,5 +28,4 @@ package object journal {
         x.confirmingChannelId - y.confirmingChannelId
       else 0
   }
-
 }
