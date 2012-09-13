@@ -16,7 +16,8 @@
 package org.eligosource.eventsourced.journal
 
 /**
- * LevelDB based journal that organizes entries based on message sequence numbers.
+ * LevelDB based journal that organizes entries primarily based on sequence numbers,
+ * keeping input and output entries separated.
  *
  * Pros:
  *

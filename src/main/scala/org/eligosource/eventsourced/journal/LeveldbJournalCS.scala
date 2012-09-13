@@ -24,10 +24,10 @@ import org.fusesource.leveldbjni.JniDBFactory._
 import org.iq80.leveldb._
 
 import org.eligosource.eventsourced.core._
-import org.eligosource.eventsourced.util.JavaSerializer
+import org.eligosource.eventsourced.util._
 
 /**
- * LevelDB based journal that organizes entries based on component id.
+ * LevelDB based journal that organizes entries primarily based on component id.
  *
  * Pros:
  *
@@ -41,9 +41,6 @@ import org.eligosource.eventsourced.util.JavaSerializer
  */
 class LeveldbJournalCS(dir: File) extends Actor {
   import LeveldbJournalCS._
-
-  // TODO: make configurable
-  private val serializer = new JavaSerializer[Message]
 
   val levelDbReadOptions = new ReadOptions
   val levelDbWriteOptions = new WriteOptions().sync(false)
@@ -100,12 +97,12 @@ class LeveldbJournalCS(dir: File) extends Actor {
       val k = Key(cmd.componentId, cmd.channelId, msg.sequenceNr, 0)
       val m = msg.copy(sender = None)
       batch.put(CounterKeyBytes, counterToBytes(counter))
-      batch.put(k.bytes, serializer.toBytes(m.copy(sender = None)))
+      batch.put(k, m.copy(sender = None))
 
       // optionally, add ack to batch
       cmd.ackSequenceNr.foreach { snr =>
         val k = Key(cmd.componentId, Channel.inputChannelId, snr, cmd.channelId)
-        batch.put(k.bytes, Array.empty[Byte])
+        batch.put(k, Array.empty[Byte])
       }
       leveldb.write(batch, levelDbWriteOptions)
       counter = counter + 1
@@ -116,12 +113,12 @@ class LeveldbJournalCS(dir: File) extends Actor {
 
   def store(cmd: WriteAck) {
     val k = Key(cmd.componentId, Channel.inputChannelId, cmd.ackSequenceNr, cmd.channelId)
-    leveldb.put(k.bytes, Array.empty[Byte], levelDbWriteOptions)
+    leveldb.put(k, Array.empty[Byte], levelDbWriteOptions)
   }
 
   def store(cmd: DeleteMsg) {
     val k = Key(cmd.componentId, cmd.channelId, cmd.msgSequenceNr, 0)
-    leveldb.delete(k.bytes, levelDbWriteOptions)
+    leveldb.delete(k, levelDbWriteOptions)
   }
 
   override def preStart() {
@@ -141,7 +138,7 @@ class LeveldbJournalCS(dir: File) extends Actor {
     val iter = leveldb.iterator(levelDbReadOptions.snapshot(leveldb.getSnapshot))
     try {
       val startKey = Key(componentId, channelId, fromSequenceNr, 0)
-      iter.seek(startKey.bytes)
+      iter.seek(startKey)
       replay(iter, startKey, p)
     } finally {
       iter.close()
@@ -152,11 +149,11 @@ class LeveldbJournalCS(dir: File) extends Actor {
   private def replay(iter: DBIterator, key: Key, p: Message => Unit): Unit = {
     if (iter.hasNext) {
       val nextEntry = iter.next()
-      val nextKey = Key(nextEntry.getKey)
+      val nextKey = bytesToKey(nextEntry.getKey)
       assert(nextKey.confirmingChannelId == 0)
-      if (key.componentId         == nextKey.componentId &&
+      if (key.componentId       == nextKey.componentId &&
         key.initiatingChannelId == nextKey.initiatingChannelId) {
-        val msg = serializer.fromBytes(nextEntry.getValue)
+        val msg = msgSerializer.fromBytes(nextEntry.getValue)
         val channelIds = confirmingChannelIds(iter, nextKey, Nil)
         p(msg.copy(acks = channelIds))
         replay(iter, nextKey, p)
@@ -168,8 +165,8 @@ class LeveldbJournalCS(dir: File) extends Actor {
   private def confirmingChannelIds(iter: DBIterator, key: Key, channelIds: List[Int]): List[Int] = {
     if (iter.hasNext) {
       val nextEntry = iter.peekNext()
-      val nextKey = Key(nextEntry.getKey)
-      if (key.componentId         == nextKey.componentId &&
+      val nextKey = bytesToKey(nextEntry.getKey)
+      if (key.componentId       == nextKey.componentId &&
         key.initiatingChannelId == nextKey.initiatingChannelId &&
         key.sequenceNr          == nextKey.sequenceNr) {
         iter.next()
@@ -181,11 +178,45 @@ class LeveldbJournalCS(dir: File) extends Actor {
 }
 
 private object LeveldbJournalCS {
-  val CounterKeyBytes = Key(0, 0, 0L, 0).bytes
+  // TODO: make configurable
+  private val msgSerializer = new JavaSerializer[Message]
 
-  def counterToBytes(value: Long) =
-    ByteBuffer.allocate(8).putLong(value).array
+  val keySerializer = new Serializer[Key] {
+    def toBytes(key: Key): Array[Byte] = {
+      val bb = ByteBuffer.allocate(20)
+      bb.putInt(key.componentId)
+      bb.putInt(key.initiatingChannelId)
+      bb.putLong(key.sequenceNr)
+      bb.putInt(key.confirmingChannelId)
+      bb.array
+    }
 
-  def bytesToCounter(bytes: Array[Byte]) =
-    ByteBuffer.wrap(bytes).getLong
+    def fromBytes(bytes: Array[Byte]): Key = {
+      val bb = ByteBuffer.wrap(bytes)
+      val componentId = bb.getInt
+      val initiatingChannelId = bb.getInt
+      val sequenceNumber = bb.getLong
+      val confirmingChannelId = bb.getInt
+      new Key(componentId, initiatingChannelId, sequenceNumber, confirmingChannelId)
+    }
+  }
+
+  val ctrSerializer = new Serializer[Long] {
+    def toBytes(ctr: Long): Array[Byte] =
+      ByteBuffer.allocate(8).putLong(ctr).array
+
+    def fromBytes(bytes: Array[Byte]): Long =
+      ByteBuffer.wrap(bytes).getLong
+  }
+
+  implicit def msgToBytes(msg: Message): Array[Byte] = msgSerializer.toBytes(msg)
+  implicit def bytesToMsg(bytes: Array[Byte]): Message = msgSerializer.fromBytes(bytes)
+
+  implicit def keyToBytes(key: Key): Array[Byte] = keySerializer.toBytes(key)
+  implicit def bytesToKey(bytes: Array[Byte]): Key = keySerializer.fromBytes(bytes)
+
+  implicit def counterToBytes(ctr: Long): Array[Byte] = ctrSerializer.toBytes(ctr)
+  implicit def bytesToCounter(bytes: Array[Byte]): Long = ctrSerializer.fromBytes(bytes)
+
+  val CounterKeyBytes = keyToBytes(Key(0, 0, 0L, 0))
 }
