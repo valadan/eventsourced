@@ -33,7 +33,7 @@ class JournalioJournal(dir: File)(implicit system: ActorSystem) extends Actor {
   val serializer = new JavaSerializer[AnyRef]
 
   val inputWriteMsgQueue = new InputWriteMsgQueue
-  val outputWriteMsgCache = new OutputWriteMsgCache
+  val outputWriteMsgCache = new OutputWriteMsgCache[Location]
 
   val disposer = Executors.newSingleThreadScheduledExecutor()
   val journal = new Journal
@@ -207,15 +207,15 @@ private [journal] class InputWriteMsgQueue extends Iterable[(WriteMsg, List[Int]
 /**
  * Cache for output WriteMsg commands.
  */
-private [journal] class OutputWriteMsgCache {
-  var cmds = SortedMap.empty[Key, (Location, WriteMsg)]
+private [journal] class OutputWriteMsgCache[L] {
+  var cmds = SortedMap.empty[Key, (L, WriteMsg)]
 
-  def update(cmd: WriteMsg, loc: Location) {
+  def update(cmd: WriteMsg, loc: L) {
     val key = Key(cmd.componentId, cmd.channelId, cmd.message.sequenceNr, 0)
     cmds = cmds + (key -> (loc, cmd))
   }
 
-  def update(cmd: DeleteMsg): Option[Location] = {
+  def update(cmd: DeleteMsg): Option[L] = {
     val key = Key(cmd.componentId, cmd.channelId, cmd.msgSequenceNr, 0)
     cmds.get(key) match {
       case Some((loc, msg)) => { cmds = cmds - key; Some(loc) }
